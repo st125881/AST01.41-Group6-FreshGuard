@@ -1,0 +1,299 @@
+[
+    {
+        "id": "444c76d29ef6c867",
+        "type": "tab",
+        "label": "FreshGuard Ingest",
+        "disabled": false,
+        "info": "",
+        "env": []
+    },
+    {
+        "id": "cc70d3c0dac5e935",
+        "type": "http in",
+        "z": "444c76d29ef6c867",
+        "name": "FreshGuard Ingest",
+        "url": "/freshguard/ingest",
+        "method": "post",
+        "upload": false,
+        "skipBodyParsing": false,
+        "swaggerDoc": "",
+        "x": 230,
+        "y": 160,
+        "wires": [
+            [
+                "9fdf763ef874e140"
+            ]
+        ]
+    },
+    {
+        "id": "9fdf763ef874e140",
+        "type": "function",
+        "z": "444c76d29ef6c867",
+        "name": "function 2",
+        "func": "const KEY = \"R+7$&%Lq5(0f5(%Ppn=qiW4EUegc)2+p\";\n\nif (msg.req.headers[\"x-freshguard-key\"] !== KEY) {\n    msg.statusCode = 401;\n    msg.payload = { error: \"unauthorized\" };\n    return msg;\n}\n\nmsg.statusCode = 202;\nreturn msg;",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 460,
+        "y": 160,
+        "wires": [
+            [
+                "ffcaaa385b984936",
+                "42867ea0eb123b42",
+                "7ae95644b78c0ab8",
+                "c30f3ff9b58cf2b4"
+            ]
+        ]
+    },
+    {
+        "id": "42867ea0eb123b42",
+        "type": "http response",
+        "z": "444c76d29ef6c867",
+        "name": "",
+        "statusCode": "",
+        "headers": {},
+        "x": 650,
+        "y": 160,
+        "wires": []
+    },
+    {
+        "id": "ffcaaa385b984936",
+        "type": "debug",
+        "z": "444c76d29ef6c867",
+        "name": "debug 2",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "payload",
+        "targetType": "msg",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 660,
+        "y": 80,
+        "wires": []
+    },
+    {
+        "id": "7ae95644b78c0ab8",
+        "type": "function",
+        "z": "444c76d29ef6c867",
+        "name": "split data",
+        "func": "return [\n    { payload: msg.payload.temperature, topic: \"temperature\" },\n    { payload: msg.payload.humidity, topic: \"humidity\" },\n    { payload: msg.payload.led_on, topic: \"led_on\" }\n];",
+        "outputs": 3,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 660,
+        "y": 240,
+        "wires": [
+            [
+                "00fe7f6c4a2ad9c8"
+            ],
+            [
+                "25f1af368d2c78be"
+            ],
+            [
+                "54b630f921425ac1"
+            ]
+        ]
+    },
+    {
+        "id": "25f1af368d2c78be",
+        "type": "ui_gauge",
+        "z": "444c76d29ef6c867",
+        "name": "humidity",
+        "group": "7ace5d16f45200cb",
+        "order": 0,
+        "width": 0,
+        "height": 0,
+        "gtype": "gage",
+        "title": "humidity",
+        "label": "units",
+        "format": "{{value}}",
+        "min": 0,
+        "max": "100",
+        "colors": [
+            "#00b500",
+            "#e6e600",
+            "#ca3838"
+        ],
+        "seg1": "",
+        "seg2": "",
+        "diff": false,
+        "className": "",
+        "x": 900,
+        "y": 240,
+        "wires": []
+    },
+    {
+        "id": "00fe7f6c4a2ad9c8",
+        "type": "ui_chart",
+        "z": "444c76d29ef6c867",
+        "name": "temperature",
+        "group": "7ace5d16f45200cb",
+        "order": 1,
+        "width": 0,
+        "height": 0,
+        "label": "temperature",
+        "chartType": "line",
+        "legend": "false",
+        "xformat": "HH:mm:ss",
+        "interpolate": "linear",
+        "nodata": "",
+        "dot": false,
+        "ymin": "",
+        "ymax": "",
+        "removeOlder": 1,
+        "removeOlderPoints": "",
+        "removeOlderUnit": "3600",
+        "cutout": 0,
+        "useOneColor": false,
+        "useUTC": false,
+        "colors": [
+            "#1f77b4",
+            "#aec7e8",
+            "#ff7f0e",
+            "#2ca02c",
+            "#98df8a",
+            "#d62728",
+            "#ff9896",
+            "#9467bd",
+            "#c5b0d5"
+        ],
+        "outputs": 1,
+        "useDifferentColor": false,
+        "className": "",
+        "x": 910,
+        "y": 200,
+        "wires": [
+            []
+        ]
+    },
+    {
+        "id": "d7e75e6d94040622",
+        "type": "ui_text",
+        "z": "444c76d29ef6c867",
+        "group": "7ace5d16f45200cb",
+        "order": 2,
+        "width": 0,
+        "height": 0,
+        "name": "led",
+        "label": "LED",
+        "format": "{{msg.payload}}",
+        "layout": "row-spread",
+        "className": "",
+        "style": false,
+        "font": "",
+        "fontSize": 16,
+        "color": "#000000",
+        "x": 1090,
+        "y": 300,
+        "wires": []
+    },
+    {
+        "id": "54b630f921425ac1",
+        "type": "function",
+        "z": "444c76d29ef6c867",
+        "name": "led_on",
+        "func": "msg.payload = msg.payload ? \"ON 🟢\" : \"OFF ⚪\";\nreturn msg;",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 890,
+        "y": 300,
+        "wires": [
+            [
+                "d7e75e6d94040622"
+            ]
+        ]
+    },
+    {
+        "id": "c30f3ff9b58cf2b4",
+        "type": "function",
+        "z": "444c76d29ef6c867",
+        "name": "function 3",
+        "func": "const p = msg.payload;\n\nmsg.payload = [\n    {\n        temperature: p.temperature,\n        humidity: p.humidity,\n        led_on: p.led_on,\n        unit_id: p.unit_id,\n        data_source: p.data_source\n    }\n];\nreturn msg;",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 660,
+        "y": 20,
+        "wires": [
+            [
+                "fa483da94cf093ea"
+            ]
+        ]
+    },
+    {
+        "id": "fa483da94cf093ea",
+        "type": "influxdb out",
+        "z": "444c76d29ef6c867",
+        "influxdb": "814772f15988568f",
+        "name": "",
+        "measurement": "sensor_data",
+        "precision": "",
+        "retentionPolicy": "",
+        "database": "database",
+        "precisionV18FluxV20": "ms",
+        "retentionPolicyV18Flux": "",
+        "org": "ait-iot-lab7",
+        "bucket": "iot_lab7",
+        "x": 990,
+        "y": 20,
+        "wires": []
+    },
+    {
+        "id": "7ace5d16f45200cb",
+        "type": "ui_group",
+        "name": "FreshGuard",
+        "tab": "ff180bad5e162eed",
+        "order": 1,
+        "disp": true,
+        "width": 6,
+        "collapse": false,
+        "className": ""
+    },
+    {
+        "id": "814772f15988568f",
+        "type": "influxdb",
+        "hostname": "127.0.0.1",
+        "port": 8086,
+        "protocol": "http",
+        "database": "database",
+        "name": "",
+        "usetls": false,
+        "tls": "",
+        "influxdbVersion": "2.0",
+        "url": "http://192.168.0.38:8086",
+        "timeout": 10,
+        "rejectUnauthorized": true
+    },
+    {
+        "id": "ff180bad5e162eed",
+        "type": "ui_tab",
+        "name": "FreshGuard Dashboard",
+        "icon": "dashboard",
+        "disabled": false,
+        "hidden": false
+    },
+    {
+        "id": "3db5a4caabd90739",
+        "type": "global-config",
+        "env": [],
+        "modules": {
+            "node-red-dashboard": "3.6.6",
+            "node-red-contrib-influxdb": "0.7.0"
+        }
+    }
+]
