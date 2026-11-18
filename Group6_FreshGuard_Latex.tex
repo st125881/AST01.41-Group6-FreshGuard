@@ -1,0 +1,629 @@
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithmic}
+\usepackage{algorithm}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{xcolor}
+\usepackage{url}
+\usepackage{balance}
+\usepackage{float} % for [H] in the appendix table
+
+\graphicspath{{fig/}}
+
+\newcommand{\degC}{\ensuremath{^{\circ}}C}
+\newcommand{\Tmax}{\ensuremath{T_{\max}}}
+% Placeholder for a number that needs the 2-hourly Unit 1 export (12 Nov 2026, 13:51)
+\newcommand{\tbd}{\textcolor{red}{\textbf{[?]}}}
+
+\def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
+    T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
+
+\begin{document}
+
+\title{FreshGuard: Design, Implementation, and Evaluation of a Low-Cost Edge-Cloud IoT System for Sustainable Cold Storage Monitoring}
+
+\author{
+\IEEEauthorblockN{Somkamon Mettawiharee}
+\IEEEauthorblockA{\textit{Information Management} \\
+\textit{Asian Institute of Technology (AIT)}\\
+Pathum Thani, Thailand \\
+st125881@ait.asia}
+\and
+\IEEEauthorblockN{Meta Puspa Maulida}
+\IEEEauthorblockA{\textit{Information Management} \\
+\textit{Asian Institute of Technology (AIT)}\\
+Pathum Thani, Thailand \\
+st126320@ait.asia}
+}
+
+\maketitle
+
+\begin{abstract}
+Refrigerators in homes and small food businesses consume substantial energy, yet they are rarely monitored: an analog thermostat dial cannot reveal a door left ajar, a drifting set point, or a degrading compressor until food has spoiled or the electricity bill arrives. Cloud-only monitoring does not fully close this gap, because alerts then depend on Wi-Fi and Internet availability, and every routine reading consumes bandwidth and cloud resources. This paper presents FreshGuard, a low-cost four-layer edge-cloud IoT system that senses temperature and humidity with a DHT22 on an ESP32, transports readings over authenticated MQTT, detects anomalies at the edge inside an isolated LXC container (a safety threshold combined with an Isolation Forest over a rolling window), and forwards only anomaly events and periodic summaries to a cloud REST and time-series back end. The prototype was deployed in a refrigerator for 5.6 days (133.9\,h of valid data after discarding eight commissioning records outside the sensor's operating range). It exposed two excursions above the 10\,\degC{} safety limit, lasting 6\,h (peak 11.2\,\degC) and 2\,h (peak 10.3\,\degC), the first of them embedded in a 27\,h warm spell between 7.9 and 11.2\,\degC, and showed that humidity transients cluster around routine door-opening times. Replaying the detectors on the logged data, the Isolation Forest flagged abrupt transitions at the edges of the excursions, whereas only the static threshold flagged sustained levels above the limit; neither flagged the onset of the warm spell, so the two mechanisms are complementary but not sufficient. Edge filtering reduces the number of messages sent to the cloud by 99.1\,\% and the application payload by 97.9\,\% relative to raw streaming, and a calibrated latency model places edge alert latency near 29\,ms regardless of WAN delay, versus 92\,ms to over 4\,s for a cloud-only path. The sensor was then moved to a second refrigerator for 64.9\,h of additional monitoring; this unit ran markedly warmer (median 7.8\,\degC{} versus 4.5\,\degC), stayed above a 5\,\degC{} guidance level in every record and above 8\,\degC{} in 44\,\% of records, yet never crossed the 10\,\degC{} limit, which shows that a single fixed threshold cannot serve all units. We also document the prototype's limitations and a concrete roadmap toward a validated deployment.
+\end{abstract}
+
+\begin{IEEEkeywords}
+edge computing, Internet of Things, MQTT, anomaly detection, Isolation Forest, cold chain, refrigeration monitoring, ESP32.
+\end{IEEEkeywords}
+
+%==================================================================
+\section{Introduction}
+Refrigeration runs around the clock and accounts for a substantial share of electricity use in homes and small food businesses, yet it is one of the least observed appliances. Inside a typical refrigerator, temperature and humidity are monitored only through an analog thermostat dial, if they are monitored at all. Spoilage risk and wasted energy therefore stay invisible until the food is already spoiled or the electricity bill reveals the loss. Temperature control of perishable food in storage and transport has long been a subject of regulatory agreements, which shows that unnoticed temperature deviations are a compliance concern and not only an efficiency problem \cite{atp}.
+
+A straightforward remedy is to stream every sensor reading to a cloud service and let the cloud raise alerts. This design does not fully solve the problem, for two reasons. First, alert latency inherits every weakness of the path to the cloud: an unstable home Wi-Fi link, a congested uplink or a full outage delays the detection of a door left open, a degrading compressor or a rapid temperature rise, and spoilage-relevant time may pass before the cloud even receives the data. Second, continuously transmitting readings during normal operation, when nothing of interest happens, wastes network bandwidth and cloud computing resources. An edge layer that detects anomalies locally and forwards only important information addresses both problems at once \cite{shi}.
+
+This report presents FreshGuard, an edge-cloud IoT platform for refrigeration monitoring, and evaluates a working prototype with data collected over almost six days in a first refrigerator, followed by a further 2.7 days in a second one. A single DHT22 temperature-and-humidity sensor is attached to an ESP32-WROOM-32 microcontroller. Readings travel over MQTT to an edge layer in which a rolling-window anomaly detector raises local alerts without waiting for the cloud. The cloud layer stores anomaly events and periodic summaries for remote monitoring, historical analysis and dashboard reporting.
+
+\subsection{Objectives}
+The main objective is to implement a four-layer edge-cloud architecture (perception, network, edge and cloud) that senses data, moves it through the network, processes it at the edge and stores only selected information in the cloud. The specific objectives are:
+\begin{itemize}
+\item \textbf{O1. Local anomaly detection.} Run anomaly detection on a containerized edge layer that triggers alerts immediately, without a round trip to the cloud.
+\item \textbf{O2. Reduced cloud traffic.} Send only anomaly events and periodic summaries, and quantify the reduction in network payload against continuous raw streaming.
+\item \textbf{O3. Alert latency.} Compare edge-layer alert latency with a cloud-processing baseline under simulated network delay.
+\end{itemize}
+
+\subsection{Contributions}
+Beyond the proposal, this final report contributes (i) a redesigned architecture and a documented MQTT topic and QoS plan; (ii) an explicit hybrid detector that couples a human-readable threshold with an Isolation Forest, including the scoring rule and the calibration of its decision threshold; (iii) an analysis of 143 hourly records collected from the prototype, including a data-quality screen, an excursion analysis and a humidity usage-pattern analysis; (iv) a replay of the detectors on the logged data, a quantitative message and payload model, and a latency model; (v) a second-unit case study in which the same sensor was moved to another refrigerator, with a cross-unit comparison of thermal behavior, excursions and threshold sensitivity; and (vi) an honest account of what the prototype data can and cannot support.
+
+The remainder of the paper is organized as follows. Section~II reviews related work and justifies the architectural and protocol choices. Section~III describes the four-layer architecture. Section~IV details the implementation. Section~V explains the experimental setup and the evaluation methodology. Section~VI presents and discusses results. Section~VII lists limitations, and Section~VIII concludes.
+
+%==================================================================
+\section{Literature Review and Related Work}
+Previous studies have explored IoT-based monitoring of refrigerators and cold-storage environments with a variety of sensing, communication and cloud-processing approaches. They demonstrate that remote environmental monitoring is feasible, but they differ in sensing technology, in where processing happens and in their communication requirements. Several studies use low-cost sensors such as the DHT11 and DHT22 for temperature and environmental monitoring, while others focus on inventory monitoring with cameras and load cells \cite{dong}--\cite{smartfridge}. Appendix~A (Table~XV) gives a system-by-system comparison.
+
+Existing systems generally emphasize continuous cloud monitoring, inventory management or remote visualization. For example, the Arduino-based system in \cite{arduino} streams every reading to a cloud service and makes no local decision, and the DHT22 evaluation in \cite{ahmad} logs measurements through a Raspberry Pi and a database without an edge-cloud anomaly-detection architecture. FreshGuard instead performs anomaly detection at the edge and transmits only selected information, so that unnecessary network traffic is avoided and temperature anomalies can be handled locally.
+
+\subsection{Reference Architecture and Protocol Trade-off}
+FreshGuard's four-layer design is mapped onto the Industrial Internet Reference Architecture (IIRA) viewpoint, which separates edge, platform and enterprise tiers. The edge layer here corresponds to the IIRA edge tier and performs local decision-making; the cloud layer corresponds to the platform and enterprise tiers and handles aggregation, storage and remote visibility \cite{iira}.
+
+\begin{table}[t]
+\caption{Protocol Comparison for the Network Layer}
+\label{tab:protocols}
+\centering
+\footnotesize
+\begin{tabular}{p{0.15\columnwidth}p{0.24\columnwidth}p{0.24\columnwidth}p{0.2\columnwidth}}
+\toprule
+ & MQTT & CoAP & HTTP \\
+\midrule
+Pattern & publish/ subscribe (broker) & request/ response & request/ response \\
+Transport & TCP & UDP & TCP \\
+Delivery & QoS 0, 1, 2 & confirmable or not & none native \\
+Fit for 30\,s telemetry & high: persistent, low overhead & medium: polling model & low: per-request headers \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+For the network layer the project chose MQTT \cite{mqtt} rather than CoAP or plain HTTP (Table~\ref{tab:protocols}). MQTT's publish/subscribe model and its persistent broker-based connection suit a sensor that continuously publishes measurements rather than being periodically polled, and a broker naturally decouples the sensor from any number of subscribers such as the edge service, a logger or a debugging client. CoAP is better suited to constrained devices that expose resources which are requested occasionally. MQTT also offers Quality of Service (QoS) levels, which let the system treat routine readings and important alerts differently.
+
+FreshGuard uses QoS~0 for routine readings, to minimize overhead, and QoS~1 for anomaly alerts, which provides at-least-once delivery and retransmission when an acknowledgement is missing. This trade-off directly supports the objective of reducing unnecessary transmission while keeping important events reliable: losing one of 120 identical-looking samples per hour is harmless, whereas losing the only alert is not.
+
+%==================================================================
+\section{Four-Layer Architecture and Interoperability}
+Figure~\ref{fig:arch} shows the four layers and the two kinds of flow that connect them: the sensor-data flow that moves left to right from the sensor towards the cloud, and the alert flow, which returns to the local actuators from the edge without leaving the premises.
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=0.9\textwidth]{fig1_architecture.png}
+\caption{FreshGuard four-layer edge-cloud architecture. Blue arrows carry QoS~0 telemetry every 30\,s; green carries hourly summaries over HTTPS to the cloud REST API; red dashed arrows carry anomaly alerts, delivered locally over MQTT QoS~1 to the buzzer and LCD with no cloud round trip, and posted as events to the cloud. Layers 2 and 3 run as two isolated LXC containers on one Proxmox VE host.}
+\label{fig:arch}
+\end{figure*}
+
+\subsection{Layer 1: Perception}
+One DHT22 sensor is connected to an ESP32-WROOM-32 microcontroller. The sensor measures temperature and humidity inside the refrigeration compartment at a fixed sampling interval, and the microcontroller publishes the readings. A piezo buzzer and an LCD form the local actuation path that signals an alert to people in the room.
+
+\subsection{Layer 2: Network}
+The network layer is an Eclipse Mosquitto MQTT broker, reached by the ESP32 over Wi-Fi. Every client authenticates with its own credentials and is confined by an access-control list to its own \texttt{fridge/\{unit\_id\}/} topic namespace, so a compromised device cannot read or write another unit's topics.
+
+\subsection{Layer 3: Edge}
+The edge layer subscribes to the sensor topics and runs inside its own LXC container on a Proxmox VE host. It contains a rolling-window anomaly detector that combines fixed safety thresholds with an Isolation Forest trained on sensor readings. When an anomaly is detected, the edge layer immediately triggers the buzzer and shows an alert message on the LCD, without waiting for the cloud.
+
+\subsection{Layer 4: Cloud}
+The cloud layer provides a REST API, a time-series data store and a Streamlit or Tableau dashboard for remote monitoring and historical reporting. Instead of every raw sample, it receives anomaly events and periodic summaries from the edge. Sensor measurements therefore remain available for local processing while only relevant information is forwarded.
+
+\subsection{Design Rationale}
+The architecture separates \emph{real-time decision-making} (edge) from \emph{long-term storage and remote visualization} (cloud). Three properties follow. (a) \emph{Autonomy:} the alert path does not depend on the Internet. (b) \emph{Economy:} the cloud sees on the order of one message per hour instead of two per 30\,s. (c) \emph{Containment:} placing the broker and the detector in separate containers means a failure or compromise in one does not directly affect the other. Table~\ref{tab:mqtt} lists the message plan that implements these properties.
+
+\begin{table}[t]
+\caption{MQTT Topic and Message Plan}
+\label{tab:mqtt}
+\centering
+\footnotesize
+\begin{tabular}{p{0.42\columnwidth}p{0.22\columnwidth}cc}
+\toprule
+Topic / endpoint & From $\rightarrow$ to & QoS & Rate \\
+\midrule
+\texttt{fridge/\{id\}/ sensor/temperature} & ESP32 $\rightarrow$ broker & 0 & 30\,s \\
+\texttt{fridge/\{id\}/ sensor/humidity} & ESP32 $\rightarrow$ broker & 0 & 30\,s \\
+\texttt{fridge/\{id\}/ status/alert} & edge $\rightarrow$ broker & 1 & on event \\
+\texttt{GET /api/fridge/ \{id\}/status} & client $\rightarrow$ cloud & HTTPS & on demand \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%==================================================================
+\section{Methodology and Implementation}
+\subsection{Hardware}
+The perception layer uses an ESP32-WROOM-32 development board (AST01.41 IKit v2.1) interfaced to a single AM2302/DHT22 digital sensor over a single-wire data line with separate power and ground. The DHT22 has a stated accuracy of $\pm$0.5\,\degC{} for temperature and $\pm$2\,\% relative humidity, and an operating range of $-40$ to 80\,\degC{} \cite{dht22}. Its recommended minimum interval between readings is 2\,s. FreshGuard samples every 30\,s, which satisfies this constraint and still gives enough temporal resolution to see sustained changes such as a refrigerator door being left open.
+
+\begin{table}[t]
+\caption{Prototype Configuration}
+\label{tab:config}
+\centering
+\footnotesize
+\begin{tabular}{p{0.3\columnwidth}p{0.62\columnwidth}}
+\toprule
+Item & Setting \\
+\midrule
+Sensor & DHT22/AM2302; $\pm$0.5\,\degC, $\pm$2\,\%RH; $-40$ to 80\,\degC \\
+Microcontroller & ESP32-WROOM-32 (AST01.41 IKit v2.1) \\
+Sampling interval & 30\,s (sensor minimum 2\,s) \\
+Rolling window & 30\,min, up to 60 observations per unit \\
+Static threshold & \Tmax{} = 10\,\degC{} (configurable) \\
+Isolation Forest (replay) & 200 trees; features [$T$, RH, $\Delta T$]; $\alpha = 0.02$ \\
+MQTT & QoS 0 for telemetry, 1 for alerts \\
+Broker & Mosquitto, TCP 1883, per-client auth + ACL \\
+Host & Proxmox VE; two isolated LXC containers \\
+Cloud interface & REST over HTTPS, per-device API key \\
+Cloud upload & hourly summary + anomaly events \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The DHT22 is mounted on an interior shelf wall, away from direct evaporator or fan airflow, so that it represents the general compartment air and not short-lived local fluctuations. The ESP32 stays outside the unit, within Wi-Fi coverage and on external power, and the sensor cable is routed through the door gasket at a corner of the seal. The resulting small local gap in the seal is a known limitation of the prototype (Section~VII).
+
+\subsection{Containerized Services and Access Control}
+The network and edge layers run as two isolated Linux Containers (LXC) on a shared Proxmox VE host. The first container runs the Eclipse Mosquitto broker on TCP port 1883 with per-client username and password authentication and an ACL restricting each client to its \texttt{fridge/\{unit\_id\}/} namespace. The second container hosts the edge anomaly-detection service, which subscribes only to the topics of the units it is responsible for. The cloud REST API is exposed exclusively over HTTPS and requires a per-device API key on every request. Authentication therefore exists at two levels, broker ACLs in the network layer and API keys in the cloud layer, so that a credential compromise is limited to the affected device or client and not to the whole platform. Table~\ref{tab:config} summarizes the configuration.
+
+\subsection{Edge-Layer Anomaly Detection}
+For each monitored unit the edge service keeps a fixed-length rolling window of the most recent 30 minutes of readings. At a 30\,s sampling interval this is up to 60 observations. The window is updated whenever a measurement arrives, so the detector can assess both the current reading and its recent context. Two mechanisms run in parallel.
+
+\textbf{Static safety threshold.} A reading above the configured upper limit is immediately a potential safety anomaly, for example $T_t > \Tmax = 10$\,\degC. The rule is simple, interpretable and effective against clearly unsafe excursions, but it says nothing about how the temperature got there.
+
+\begin{algorithm}[t]
+\caption{Edge processing loop for one unit}
+\label{alg:edge}
+\begin{algorithmic}[1]
+\REQUIRE $T_{\max}$, trained forest $F$, threshold $\tau$, window length $W$
+\FOR{each new reading $(T_t, RH_t)$ on \texttt{sensor/*}}
+  \STATE append to window; drop oldest if size $> W$;
+  \STATE compute $\Delta T_t$ and $\mathbf{x}_t$ from the window;
+  \STATE $a_1 \leftarrow [T_t > T_{\max}]$;
+  \STATE $a_2 \leftarrow [s_F(\mathbf{x}_t) > \tau]$;
+  \IF{$a_1 \lor a_2$}
+    \STATE activate buzzer + LCD (local, immediate);
+    \STATE publish to \texttt{status/alert} with QoS 1;
+  \ENDIF
+  \IF{hour boundary}
+    \STATE POST summary (mean, min, max, SD) over HTTPS;
+  \ENDIF
+\ENDFOR
+\end{algorithmic}
+\end{algorithm}
+
+\textbf{Isolation Forest.} An Isolation Forest \cite{iforest} is trained offline on readings collected during normal operation. It builds an ensemble of random trees; each tree recursively splits the feature space with a randomly chosen feature and split value. Anomalous points are different from the bulk of the data and are therefore isolated after fewer splits, i.e.\ they have a shorter average path length $E[h(\mathbf{x})]$. The anomaly score is
+\begin{equation}
+s(\mathbf{x},n) = 2^{-E[h(\mathbf{x})]/c(n)}, \quad c(n) = 2H(n-1) - \frac{2(n-1)}{n},
+\label{eq:score}
+\end{equation}
+where $n$ is the training-sample size per tree, $H(\cdot)$ the harmonic number, and $s$ close to 1 indicates an anomaly. The feature vector is $\mathbf{x}_t = [T_t, RH_t, \Delta T_t]$, combining level, humidity and rate of change. The decision threshold $\tau$ is calibrated as the $(1-\alpha)$-quantile of the scores on the training data, so that roughly a fraction $\alpha$ of normal training points would be flagged. The Isolation Forest contributes a data-driven check that can find unusual patterns that have not yet crossed the fixed limit, for instance an abnormally rapid rise caused by a door left open, or behavior caused by a degrading compressor.
+
+\textbf{Alert rule and policy.} The edge service raises an alert whenever either mechanism fires:
+\begin{equation}
+A_t = \big[\,T_t > \Tmax\,\big] \;\lor\; \big[\,s(\mathbf{x}_t) > \tau\,\big].
+\label{eq:alert}
+\end{equation}
+Algorithm~\ref{alg:edge} shows the processing loop. The alert is generated locally and does not need the cloud.
+
+\subsection{End-to-End Data Pathway}
+The sensor-to-dashboard pathway has four stages. First, the ESP32 reads the DHT22 and publishes temperature and humidity to \texttt{fridge/\{unit\_id\}/sensor/temperature} and \texttt{.../humidity} with QoS~0, because these measurements are non-critical and low overhead has priority. Second, the edge container subscribes to the same topics, appends each measurement to the unit's rolling window and evaluates both detectors. Third, the path forks. If no anomaly is found, the edge layer takes no alert action and sends only a periodic summary, for example an hourly aggregate, to the cloud REST endpoint. If an anomaly is found, it immediately activates the buzzer and LCD, independent of Internet connectivity, and publishes the event to \texttt{fridge/\{unit\_id\}/status/alert} with QoS~1 (at-least-once delivery, retransmitted if unacknowledged). Fourth, the cloud layer receives the summaries and events through the REST API, stores them in a time-series database and exposes them in the dashboard; current status can also be queried through \texttt{GET /api/fridge/\{unit\_id\}/status}.
+
+%==================================================================
+\section{Experimental Setup and Evaluation Method}
+\subsection{Deployment and Data}
+The prototype monitored one refrigerator (Unit~1) from 3 November 2026, 15:00 to 9 November 2026, 12:56 (141.9\,h). Two series were exported from the monitoring dashboard as CSV files: temperature and humidity, each with 143 rows. Rows are hourly values at the dashboard's resolution; the final row of each file is the latest reading at export time (12:56). The raw 30\,s samples are not part of the exported data, and the dashboard's aggregation (mean or last value per hour) is not recorded in the export, so all statistics below describe hourly values. Values carry unit suffixes (``\degC'' and ``\%H'') that were stripped during parsing, and the two files were paired row by row (timestamps agree exactly except for the last row, where they differ by 20\,s).
+
+On 9 November 2026 at about 19:00 the same sensor and ESP32 were moved to a second refrigerator (Unit~2) and monitoring continued with the same firmware, topics and thresholds. A later export (12 November 2026, 13:51) covers both deployments at a coarser resolution of one value every two hours (108 rows per series). Unit~2 is evaluated from this export (Section~VI-I). To check that the coarser export is a fair basis for comparison, the Unit~1 statistics were recomputed from it; they agree closely with the hourly ones (mean 5.31 versus 5.32\,\degC{} and 38.4 versus 38.7\,\% RH).
+
+\subsection{Data-Quality Screen}
+Before analysis, readings were screened against the physical operating range of the sensor ($-40$ to 80\,\degC) and the plausible range of a refrigerator. The first eight records (3 Nov, 15:00--22:00) were classed as a \emph{commissioning phase} and excluded, as detailed in Section~VI-A. The remaining 135 records (3 Nov 23:00 to 9 Nov 12:56, 133.9\,h) are the \emph{valid set} used for all Unit~1 statistics. The same screen was applied to Unit~2 (Section~VI-I).
+
+\subsection{Evaluation Methodology}
+Thermal and humidity behavior is described with descriptive statistics (mean, SD, median, percentiles), daily summaries and an episode analysis. An \emph{excursion episode} is a maximal run of hourly records above \Tmax, with gaps of up to three hours merged. \emph{Detector replay (O1):} the hybrid detector of Section~IV-C is run offline on the valid set. The forest is trained on the 61\,h of baseline operation that precede the sustained temperature rise of 6 Nov (4 Nov 00:00 to 6 Nov 12:00; the first record above 9\,\degC{} is 6 Nov 16:00), using the features [$T$, RH, $\Delta T$] with $\Delta T$ the one-hour difference, 200 trees, a fixed random seed and $\alpha = 0.02$, all chosen before looking at test results. The remaining 73 records form the test set. Because no ground-truth labels exist, agreement and overlap between detectors are reported rather than precision or recall. \emph{Communication cost (O2)} is an analytical model using the observed number of alert episodes. \emph{Latency (O3)} is a Monte-Carlo model (Section~VI-G). Neither of the last two is a packet-level measurement.
+
+%==================================================================
+\section{Results and Discussion}
+\subsection{Data Quality and Commissioning Phase}
+Figure~\ref{fig:commission} shows the first eight records. Four of them (152, 88.8, 166 and 187\,\degC) exceed the DHT22's 80\,\degC{} upper operating limit, and three more (20.0, 34.2 and 59.8\,\degC) are implausible for a refrigerator compartment. The remaining record (7.42\,\degC{} at 20:00) is plausible in isolation but is sandwiched between invalid readings and is excluded with them. From 23:00 onwards values return to the 2.0--11.2\,\degC{} range and never leave it again. A sensor inside a working refrigerator cannot report 187\,\degC; these values are more consistent with the installation and testing period, for example a sensor handled outside the unit, powered up near a heat source or still being wired, than with the refrigerator itself, although the log cannot confirm the exact cause. They are excluded from all statistics. This screen is cheap to implement at the edge as a plausibility check ($T \notin [-40, 80]$) and illustrates why a first-line validity filter belongs before the anomaly detector: without it, these eight records would inflate the mean temperature from 5.3\,\degC{} to 10.0\,\degC{} and the standard deviation from 2.4\,\degC{} to 25.0\,\degC.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{fig2_commissioning.png}
+\caption{Hourly temperature during the first eight hours (3 Nov, 15:00--22:00). Four readings exceed the DHT22's 80\,\degC{} operating limit, so the period is treated as commissioning and excluded.}
+\label{fig:commission}
+\end{figure}
+
+\subsection{Thermal and Humidity Behavior}
+Table~\ref{tab:desc} summarizes the Unit~1 valid set (its Unit~2 counterpart is in Section~VI-I), and Fig.~\ref{fig:series} shows both series. The refrigerator mostly operated between 2 and 5\,\degC{} (median 4.58\,\degC; 5th--95th percentile 2.39--10.0\,\degC). The distribution is strongly right-skewed because of the warm spell and the excursions: the mean (5.32\,\degC) lies above the median, and the 95th percentile is more than double the median. Humidity has a median of 36.0\,\% RH with a long upper tail caused by short transients (maximum 77.9\,\% RH). The Pearson correlation between the temperature and humidity series is almost zero ($r = -0.02$; Spearman $\rho = -0.19$), meaning that humidity is not a simple function of temperature but carries independent information about door activity and moisture load, which is a reason to monitor both channels.
+
+\begin{table}[t]
+\caption{Descriptive Statistics of the Valid Set (Unit 1, $N = 135$ Hourly Values)}
+\label{tab:desc}
+\centering
+\footnotesize
+\begin{tabular}{lrrrrrrr}
+\toprule
+ & Mean & SD & Min & P5 & Med. & P95 & Max \\
+\midrule
+$T$ (\degC) & 5.32 & 2.36 & 2.05 & 2.39 & 4.58 & 10.0 & 11.2 \\
+RH (\%) & 38.7 & 9.43 & 26.8 & 28.0 & 36.0 & 56.9 & 77.9 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[t]
+\caption{Daily Summary of the Valid Set (Unit 1, Hourly Values)}
+\label{tab:daily}
+\centering
+\footnotesize
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{lrrcrrr}
+\toprule
+Day (2026) & $n$ & $\bar T$ & $T_{\min}$--$T_{\max}$ & Overnight $\tilde T$ & $\overline{\mathrm{RH}}$ & RH$_{\max}$ \\
+\midrule
+4 Nov & 24 & 3.18 & 2.05--7.44 & 2.50 & 42.9 & 66.4 \\
+5 Nov & 24 & 4.02 & 3.33--5.12 & 4.06 & 38.2 & 50.7 \\
+6 Nov & 24 & 5.84 & 3.24--9.91 & 3.58 & 36.9 & 55.9 \\
+7 Nov & 24 & 8.34 & 4.59--11.2 & 8.34 & 35.6 & 70.3 \\
+8 Nov & 24 & 5.15 & 3.93--10.3 & 4.78 & 38.6 & 77.9 \\
+9 Nov$^\dagger$ & 14 & 5.36 & 4.79--6.87 & 5.33 & 38.4 & 51.2 \\
+\bottomrule
+\multicolumn{7}{l}{\scriptsize $^\dagger$partial day (to 12:56). The single valid record of 3 Nov (6.03\,\degC) is omitted.}
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:daily} shows how the daily operating level moved. The overnight (00:00--07:00) median temperature, a good proxy for the unit's undisturbed state because few doors are opened, rose from 2.5\,\degC{} on 4 Nov to 4.1\,\degC{} on 5 Nov, was 3.6\,\degC{} on 6 Nov, spiked to 8.3\,\degC{} during the warm spell of 6--7 Nov (Section~VI-C), and settled at 4.8 and 5.3\,\degC{} on 8 and 9 Nov. This step-like pattern, with each plateau higher than the first day, would be invisible to someone who opens the door occasionally and looks at a dial, but it is exactly what an edge detector with a rolling window can track. It is consistent with a change of the thermostat set point or with a heavier load, but the logged data alone cannot distinguish between these explanations.
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=0.85\textwidth]{fig3_valid_series.png}
+\caption{Hourly temperature (top) and relative humidity (bottom) over the valid period of Unit~1. Shaded bands mark the threshold excursions E1 (7 Nov) and E2 (8 Nov). The dashed line is the 10\,\degC{} safety limit; the dotted line is a stricter 5\,\degC{} guidance level shown for context.}
+\label{fig:series}
+\end{figure*}
+
+\subsection{Excursion Events}
+Two episodes exceeded the 10\,\degC{} limit (Table~\ref{tab:episodes}). Roughly 5\,\% of all valid hours (7 of 135) were spent above the limit, against 19\,\% (26 of 135) above 8\,\degC.
+
+\begin{table}[t]
+\caption{Threshold Excursion Episodes ($T > 10$\,\degC, Unit 1)}
+\label{tab:episodes}
+\centering
+\footnotesize
+\begin{tabular}{llccc}
+\toprule
+ID & Window (2026) & Span & Hrs $>10$ & \Tmax \\
+\midrule
+E1 & 7 Nov 13:00 -- 7 Nov 18:00 & 6\,h & 5 & 11.2 \\
+E2 & 8 Nov 20:00 -- 8 Nov 21:00 & 2\,h & 2 & 10.3 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{E1: door-type jump on top of a sustained warm spell.} E1 sits inside a longer event. Temperature climbed from 4.2\,\degC{} at 12:00 on 6 Nov through 7.1\,\degC{} at 15:00 to 9.3\,\degC{} at 16:00 and then stayed between about 7.9 and 9.9\,\degC{} for 21\,h, below the limit, with three hourly values at or just below 8\,\degC{} (8.00, 7.92 and 7.93\,\degC). Only at 13:00 on 7 Nov did a jump of 2.4\,\degC{} to 10.9\,\degC{} carry the reading above the limit, after which it stayed above 10\,\degC{} (except for 9.72\,\degC{} at 14:00) until a peak of 11.2\,\degC{} at 17:00. The whole warm spell lasted 27\,h (6 Nov 16:00 to 7 Nov 18:00). Unlike a brief door opening, it was a plateau: the humidity dropped to 27--29\,\% RH while the temperature rose. This is physically consistent with warming air that holds roughly the same amount of water vapor: using a Magnus-form approximation of saturation vapor pressure \cite{magnus}, the mean vapor pressure was 3.0\,hPa over the baseline period (5 Nov 00:00 to 6 Nov 11:00) and 3.4\,hPa in the first 14\,h of the warm spell, i.e.\ only about 10\,\% higher while the temperature rose from a median of 3.9 to 9.0\,\degC. The compartment air therefore did not receive a large injection of moist room air; warm room air in a tropical climate would be expected to carry several times this vapor pressure. This argues against a door simply left open throughout and favors a sustained reduction in cooling (a changed set point, a defrost or compressor problem, or a loss of power). Because the prototype had no door contact or power monitor, the cause was not recorded; the plateau ended abruptly, falling from 10.6 to 7.95 to 4.59\,\degC{} in two hours, which suggests an intervention. The humidity spike of 70.3\,\% RH at 13:00 on 7 Nov, coincident with the 2.4\,\degC{} jump, is typical of a door opening or loading of warm, moist items. E1 is therefore best read as a door-type event that pushed an already warm compartment over the limit. A consequence of the 10\,\degC{} limit is that the first alarm arrived 21\,h after the temperature first exceeded 9\,\degC{} (6 Nov 16:00), because 19 of the 26 hours above 8\,\degC{} lay between 8 and 10\,\degC.
+
+\textbf{E2: short door-type transient.} On the evening of 8 Nov temperature jumped 6.0\,\degC{} in one hour to 10.3\,\degC{} with a humidity peak of 77.9\,\% RH, then fell to 7.15\,\degC{} at 22:00 and below 5\,\degC{} at 01:00. The simultaneous sharp rise of temperature and humidity and the fast recovery are the signature of a short door-opening or loading event. This is the sort of event that the edge layer should log but not escalate indefinitely, which motivates a two-tier alert policy (Section~VIII).
+
+\subsection{Humidity as a Usage Signal}
+Figure~\ref{fig:hod} shows the median humidity by hour of day. Between 02:00 and 08:00 the median sits at about 34--35\,\% RH, but there are two recurring peaks, at 13:00 (median 55.9\,\% RH) and at 20:00 (median 54.6\,\% RH), with smaller bumps around 09:00--10:00. On four of the five complete days (4--7 Nov), humidity at 13:00 exceeded that day's overnight median by 10--43 percentage points, and at 20:00 it did so by 27--45 points on three of the five days (4, 7 and 8 Nov). The timing is consistent with routine access to the refrigerator around midday and evening meals. A door sensor was not fitted, so this remains an inference, but it shows that a single low-cost humidity channel captures behavior that temperature alone averages out at hourly resolution.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{fig4_humidity_by_hour.png}
+\caption{Relative humidity by hour of day (Unit~1): median (line) and interquartile range (band) over the valid set. Recurring peaks at 13:00 and 20:00 are consistent with routine door openings.}
+\label{fig:hod}
+\end{figure}
+
+\subsection{Detector Replay (O1)}
+Figure~\ref{fig:replay} and Table~\ref{tab:replay} compare the two mechanisms on the logged data. Of the 73 test records, the static threshold (10\,\degC) flags 7 and the Isolation Forest flags 6; two records are flagged by both and four only by the forest. All 7 threshold flags belong to E1 and E2. The forest's flags are located at transitions: the humidity-and-temperature jump at 13:00 on 7 Nov (and the 1.2\,\degC{} drop that follows at 14:00), the steep drops of $-2.7$ and $-3.4$\,\degC{} per hour (19:00--20:00, 7 Nov) when the warm spell ended, the $+6.0$\,\degC{} jump that opens E2 and the $-3.2$\,\degC{} drop that closes it. All four forest-only flags (9.72, 7.95, 4.59 and 7.15\,\degC) lie below the 10\,\degC{} limit and are therefore invisible to the threshold; two of them mark the recovery from the warm spell, which the static rule cannot see.
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=0.85\textwidth]{fig5_replay.png}
+\caption{Offline replay of the hybrid detector (Unit~1). Top: hourly temperature with threshold flags (red dots, $T > 10$\,\degC) and Isolation Forest flags (blue rings); the green band is the 61\,h training window. Bottom: flag timeline per detector.}
+\label{fig:replay}
+\end{figure*}
+
+\begin{table}[t]
+\caption{Detector Comparison on the Test Set (73 Hourly Records)}
+\label{tab:replay}
+\centering
+\footnotesize
+\begin{tabular}{p{0.42\columnwidth}cp{0.36\columnwidth}}
+\toprule
+Quantity & Value & Comment \\
+\midrule
+Threshold flags ($>10$\,\degC) & 7 & E1: 5, E2: 2 \\
+Isolation Forest flags & 6 & trained on 61 records \\
+Flagged by both & 2 & 7 Nov 13 h; 8 Nov 20 h \\
+Forest only & 4 & 7 Nov 14, 19, 20 h; 8 Nov 22 h \\
+Threshold only & 5 & 7 Nov 15--18 h; 8 Nov 21 h \\
+Union (alarm records) & 11 & \\
+First flag E1: threshold & 7 Nov 13:00 & 10.90\,\degC \\
+First flag E1: forest & 7 Nov 13:00 & no lead \\
+First flag E2: both & 8 Nov 20:00 & same hour \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The forest did \emph{not} flag the onset of the warm spell. The temperature rose by 1.9 and 2.2\,\degC{} per hour at 15:00 and 16:00 on 6 Nov, which is within the range of rate-of-change values in its training window (the training data itself contains a $+2.15$\,\degC{} jump on 4 Nov at 21:00), and the humidity fell rather than rose. Neither detector fired during the following 21\,h, in which the temperature stayed between 7.9 and 9.9\,\degC. It therefore provided no lead time ahead of the threshold in this data set: the first alert of either kind (10.90\,\degC, 7 Nov 13:00) was raised by both at once. Two further forest flags occur inside its own training window (4 Nov 00:00 and 21:00), as expected from the 2\,\% calibration level. The honest conclusion is that the two mechanisms are complementary but cover different things: the threshold detects sustained unsafe \emph{levels}; the forest detects abrupt, unusual \emph{transitions}. A slow, gradual drift, which is the most plausible form of compressor degradation, is not reliably caught by either, which motivates adding a rate-of-change or cumulative-sum (CUSUM) detector on the 30\,min rolling window (Section~VIII).
+
+\textbf{Threshold sensitivity.} Table~\ref{tab:sens} shows how the choice of \Tmax{} changes the picture. At 10\,\degC{} the system raises two episodes and the unit is above the limit for 5\,\% of the time; at 8\,\degC{} it would also raise two episodes, but the 27\,h warm spell would then be one continuous episode starting 21\,h earlier, and at a stricter household guideline level of 5\,\degC{} the unit would be in alarm for 39\,\% of the time, because the refrigerator's baseline after 7 Nov sat near 5\,\degC. A single threshold therefore cannot serve both as a ``needs attention'' and as an ``unsafe now'' signal. A two-tier policy (a warning at about 5\,\degC{} sustained for a defined time, and a critical alarm at 10\,\degC) is the practical consequence.
+
+\begin{table}[t]
+\caption{Sensitivity of Alarming to the Upper Threshold (Unit 1, Hourly Data)}
+\label{tab:sens}
+\centering
+\footnotesize
+\begin{tabular}{cccc}
+\toprule
+\Tmax{} (\degC) & Hours above & Share (\%) & Episodes \\
+\midrule
+4 & 89 & 65.9 & 4 \\
+5 & 53 & 39.3 & 5 \\
+6 & 37 & 27.4 & 4 \\
+8 & 26 & 19.3 & 2 \\
+\textbf{10} & \textbf{7} & \textbf{5.2} & \textbf{2} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Replay caveat.} The replay is at hourly resolution, because the 30\,s samples were not exported. At the deployed 30\,s resolution the feature $\Delta T$ is on a different scale (a door opening raises temperature by a fraction of a degree between samples), so the deployed forest must be trained on 30\,s data and the 30\,min window. The replay demonstrates the method and the qualitative behavior of the two detectors; it is not a performance estimate for the deployed model.
+
+\subsection{Reduced Cloud Traffic (O2)}
+Raw streaming would send one record (both channels) every 30\,s, i.e.\ $f_s T_{\mathrm{obs}} = 120 \times 134 = 16{,}080$ records over the 134\,h observation window. The edge design sends $N_h = 134$ hourly summaries plus alert messages. The replay produced four alarm episodes (two in the forest's training window and two in the test set), each of which costs an \emph{open} and a \emph{clear} message, so $N_e = 4$ and
+\begin{equation}
+M_{\mathrm{edge}} = N_h + 2N_e = 134 + 8 = 142.
+\label{eq:medge}
+\end{equation}
+Using concrete example JSON schemas (a raw record of 65\,B, an hourly summary with mean, min, max and SD for both channels of 156\,B, and an alert event of 115\,B), the payload falls from 1,045\,kB to 21.8\,kB (Table~\ref{tab:traffic}, Fig.~\ref{fig:traffic}). This is a \textbf{99.1\,\%} reduction in messages and a \textbf{97.9\,\%} reduction in application payload.
+
+These figures are an analytical estimate, not a network capture, and three caveats apply. They exclude TLS, TCP and HTTP header overhead; because that overhead is paid per message, including it would increase the saving, not reduce it. The alert count comes from an hourly replay and could be higher at 30\,s resolution if the signal flaps around a threshold, which is why the edge service should apply hysteresis before it publishes. Finally, the saving applies to the cloud link: the sensor-to-broker traffic stays on the local network, where it is cheap.
+
+\begin{table}[t]
+\caption{Cloud Traffic: Raw Streaming versus Edge Filtering (134\,h)}
+\label{tab:traffic}
+\centering
+\footnotesize
+\begin{tabular}{lrrr}
+\toprule
+ & Raw 30\,s & Edge & Reduction \\
+\midrule
+Messages to cloud & 16,080 & 142 & 99.1\,\% \\
+Application payload (kB) & 1,045 & 21.8 & 97.9\,\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{fig6_traffic.png}
+\caption{Messages (left) and application payload (right) sent to the cloud over 134\,h by raw streaming versus the edge design.}
+\label{fig:traffic}
+\end{figure}
+
+\subsection{Alert Latency (O3)}
+Alert latency here is the time from a reading being available at the sensor side to the local actuator being driven. The edge path consists of the Wi-Fi hop to the broker, the edge computation, the alert hop back to the local actuator and the actuation itself; the cloud-only path crosses the WAN twice, adding a cloud processing time. With $d$ the added one-way WAN delay,
+\begin{align}
+L_{\mathrm{edge}} &= \ell_{\mathrm{up}} + p_{\mathrm{edge}} + \ell_{\mathrm{down}} + a, \label{eq:ledge}\\
+L_{\mathrm{cloud}} &= w_{\mathrm{up}}(d) + p_{\mathrm{cloud}} + w_{\mathrm{down}}(d) + \ell_{\mathrm{down}} + a, \label{eq:lcloud}
+\end{align}
+where $\ell$ are LAN hops (lognormal, median 6\,ms), $a = 1$\,ms is actuation, $w(d) = 25 + d + \mathrm{jitter}$\,ms (lognormal jitter, median 8\,ms), $p_{\mathrm{cloud}}$ has a median of 15\,ms, and $p_{\mathrm{edge}}$ is based on a measured Isolation Forest scoring time of 13\,ms per sample on the analysis workstation, which is a stand-in for the edge container's hardware. A Monte-Carlo run with 20,000 trials per setting (Fig.~\ref{fig:latency}) gives an edge latency with a median of 28.5\,ms (95th percentile 43\,ms) that does not change with $d$, while the cloud-only path grows from 92\,ms at $d = 0$ to 592\,ms at $d = 250$\,ms and 4.1\,s at $d = 2$\,s. Under a complete Internet outage the cloud path delivers no alert at all, whereas the edge path is by construction unaffected.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{fig7_latency.png}
+\caption{Modeled alert latency versus added one-way WAN delay (log scale). The edge path (blue) is independent of WAN delay; the cloud-only path (orange) grows with it. Lines are medians; bands extend to the 95th percentile.}
+\label{fig:latency}
+\end{figure}
+
+This result is largely a consequence of the architecture and the stated assumptions, and it is not an empirical measurement of the testbed. Its value is in sizing: it shows that the edge advantage is robust to the unknown parameters, since the edge latency is dominated by LAN and compute terms that are tens of milliseconds, while any realistic WAN path adds at least a hundred milliseconds and a failure removes the alert altogether. Both paths share a detection delay of up to one sampling interval (30\,s), which is excluded from the comparison. A measured validation, for example with a Linux \texttt{tc netem} delay on the container's uplink, is listed as future work.
+
+\subsection{Security and Robustness Discussion}
+Layered access control limits blast radius: a stolen device credential grants access to that unit's topics and API key only. Placing the broker and detector in separate containers contains faults. QoS~1 for alerts supplies at-least-once delivery, so duplicates are possible and the cloud endpoint should be idempotent. These properties are design-level; the prototype was not penetration-tested, and no failure-injection experiments (broker crash, Wi-Fi drop) were run in this trial.
+
+\subsection{Second Refrigerator (Unit 2)}
+After the first trial the sensor was moved to a second refrigerator on 9 November 2026 at about 19:00, with the same firmware, topics and 10\,\degC{} threshold. This subsection evaluates that deployment and compares it with Unit~1. It is a second case study and not a validation: the two units differ in appliance, load, set point and sensor position, and none of these was recorded.
+
+\textbf{Data and screening.} Unit~2 is analyzed from the 2-hourly export of 12 November 2026, 13:51 (Section~V). The records of 9 Nov 15:00 (7.31\,\degC, 66.5\,\% RH) and 17:00 (20.6\,\degC) are the sensor being removed from Unit~1 and carried, and the record at 19:00 (10.1\,\degC, 53.2\,\% RH) is the sensor settling after placement; all three are treated as a second commissioning phase and excluded, in the same way as in Section~VI-A. The Unit~2 valid set therefore has $N = 34$ records from 9 Nov 21:00 to 12 Nov 13:51 (64.9\,h); the last record lies off the 2\,h grid. For a like-for-like comparison, Unit~1 is taken from the same export, from 4 Nov 01:00 to 9 Nov 13:00 ($N = 67$).
+
+\textbf{Thermal and humidity behavior.} Table~\ref{tab:two} and Fig.~\ref{fig:unit2} show that Unit~2 ran markedly warmer: median 7.83\,\degC{} versus 4.53\,\degC{} for Unit~1, with a lowest reading of 5.82\,\degC. Its spread is smaller (SD 1.15 versus 2.35\,\degC) because it has no deep-cold phase, so its distribution sits almost entirely above Unit~1's interquartile range (Fig.~\ref{fig:box}). The 5\,\degC{} guidance level was exceeded in all 34 records and 8\,\degC{} in 15 of them (44.1\,\%), against 13 of 67 (19.4\,\%) for Unit~1, but the 10\,\degC{} limit was never exceeded (maximum 9.72\,\degC). Humidity is lower (median 28.5 versus 36.3\,\% RH) and its transients are smaller (maximum 45.1 versus 65.0\,\% RH). The temperature--humidity correlation also differs: $r = +0.45$ (Spearman $\rho = +0.28$) for Unit~2 against $r = -0.06$ ($\rho = -0.20$) for Unit~1. In Unit~1 the temperature behavior was dominated by a warm spell that was unrelated to humidity; in Unit~2 the temperature spikes coincide with humidity spikes, i.e.\ door-type events on top of a warm baseline. With 34 points this correlation is imprecise and should be read as indicative only.
+
+\begin{table}[t]
+\caption{Descriptive Statistics of the Two Units (2-Hourly Export)}
+\label{tab:two}
+\centering
+\footnotesize
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{llrrrrrrr}
+\toprule
+Unit & Var. & Mean & SD & Min & P5 & Med. & P95 & Max \\
+\midrule
+1 ($N=67$) & $T$ (\degC) & 5.31 & 2.35 & 2.13 & 2.50 & 4.53 & 9.66 & 11.0 \\
+ & RH (\%) & 38.4 & 7.96 & 27.1 & 28.1 & 36.3 & 53.2 & 65.0 \\
+2 ($N=34$) & $T$ (\degC) & 7.74 & 1.15 & 5.82 & 5.97 & 7.83 & 9.50 & 9.72 \\
+ & RH (\%) & 30.6 & 6.08 & 24.3 & 24.5 & 28.5 & 43.4 & 45.1 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=0.8\textwidth]{fig8_unit2_series.png}
+\caption{Unit~2 temperature (top) and relative humidity (bottom), 2-hourly values from 9 Nov 21:00 to 12 Nov 13:51. The grey point is the settling record (9 Nov 19:00), excluded from the statistics. The dashed red line is the 10\,\degC{} safety limit, which no post-settling record exceeds; the dotted line is the 5\,\degC{} guidance level.}
+\label{fig:unit2}
+\end{figure*}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{fig9_two_unit_boxplots.png}
+\caption{Temperature (left) and relative humidity (right) of the two units on the same 2-hourly export. Dashed and dotted lines on the temperature panel are the 10\,\degC{} limit and 5\,\degC{} guidance level.}
+\label{fig:box}
+\end{figure}
+
+\textbf{Daily level.} Table~\ref{tab:day2} shows a downward trend: the overnight (00:00--07:00) median fell from 8.44\,\degC{} on 10 Nov to 7.11\,\degC{} on 11 Nov and 5.97\,\degC{} on 12 Nov. The unit was therefore cooling down during the observation, but it had not reached the 2.5--5\,\degC{} range of Unit~1 at the time of export. The log cannot say whether this is a set-point change, a load that was settling or a defrost cycle.
+
+\begin{table}[t]
+\caption{Daily Summary of the Unit 2 Valid Set (2-Hourly Values)}
+\label{tab:day2}
+\centering
+\footnotesize
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{lrrcrrr}
+\toprule
+Day (2026) & $n$ & $\bar T$ & $T_{\min}$--$T_{\max}$ & Overnight $\tilde T$ & $\overline{\mathrm{RH}}$ & RH$_{\max}$ \\
+\midrule
+9 Nov$^\dagger$ & 2 & 8.94 & 8.62--9.26 & -- & 32.7 & 33.9 \\
+10 Nov & 12 & 8.53 & 7.46--9.72 & 8.44 & 29.6 & 44.2 \\
+11 Nov & 12 & 7.23 & 6.30--8.28 & 7.11 & 32.3 & 45.1 \\
+12 Nov$^\ddagger$ & 8 & 7.00 & 5.82--9.23 & 5.97 & 29.0 & 42.5 \\
+\bottomrule
+\multicolumn{7}{l}{\scriptsize $^\dagger$from 21:00. $^\ddagger$to 13:51.}
+\end{tabular}
+\end{table}
+
+\textbf{Excursion events.} Applying the rule of Section~V to the coarser sampling (gaps of up to four hours merged), Unit~2 has \emph{no} episode above the 10\,\degC{} limit, against two for Unit~1 in the hourly data. Because the unit nevertheless ran warm, Table~\ref{tab:x} lists for context the episodes above 8\,\degC{}, a level that is below the limit but exceeded in 15 records; five such episodes occur.
+\begin{itemize}
+\item X1 (9 Nov 21:00 -- 10 Nov 05:00, peak 9.41\,\degC) and X2 (10 Nov 13:00--21:00, peak 9.72\,\degC) are plateaus of about 8\,h each with RH of 24--26\,\% between the humidity peaks. The mean vapor pressure over 9 Nov 21:00 to 10 Nov 11:00 was 3.04\,hPa at a median temperature of 8.4\,\degC, practically the same as the Unit~1 baseline (3.0\,hPa) and below the 3.4\,hPa seen in the warm spell of Unit~1. As there, the air was warm but not moist, which argues against a door left open and favors reduced cooling. The settling record at 19:00 (10.1\,\degC) suggests that X1 had already started at placement, so its true duration is probably longer than the 8\,h of valid records.
+\item X3 (11 Nov 09:00, 8.22\,\degC, 39.6\,\% RH) and X4 (11 Nov 19:00, 8.28\,\degC, 45.1\,\% RH) are single records in which temperature and humidity rise together, the door-type signature seen as E2 in Unit~1, but smaller in amplitude.
+\item X5 (from 12 Nov 11:00) starts with a rise of 2.92\,\degC{} in two hours to 8.90\,\degC{} while RH stays near 31\,\%, i.e.\ a warm but dry signature, then reaches 9.23\,\degC{} with 42.5\,\% RH at 13:51, which looks like a door event on top of it. The episode was still open at export, so its duration is right-censored. Its cause cannot be determined without a door or power log.
+\end{itemize}
+Between the first and last plateaus, the cooler spell of 11 Nov 23:00 to 12 Nov 09:00 had a median of 5.98\,\degC{} and a mean vapor pressure of 2.49\,hPa.
+
+\begin{table}[t]
+\caption{Episodes Above 8\,\degC{} in Unit 2 (Context, Below the 10\,\degC{} Limit)}
+\label{tab:x}
+\centering
+\footnotesize
+\setlength{\tabcolsep}{2.5pt}
+\begin{tabular}{llccl}
+\toprule
+ID & Window (2026) & Rec. $>8$ & \Tmax & Note \\
+\midrule
+X1 & 9 Nov 21:00 -- 10 Nov 05:00 & 5 & 9.41 & plateau \\
+X2 & 10 Nov 13:00 -- 10 Nov 21:00 & 5 & 9.72 & plateau \\
+X3 & 11 Nov 09:00 & 1 & 8.22 & door-type \\
+X4 & 11 Nov 19:00 & 1 & 8.28 & door-type \\
+X5 & 12 Nov 11:00 -- 13:51 (open) & 3 & 9.23 & dry rise, then door-type \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Threshold sensitivity across units.} Table~\ref{tab:sens2} repeats the sensitivity analysis for both units on the 2-hourly export. At the 10\,\degC{} limit Unit~2 never alarms (0 of 34 records), although it spends 44\,\% of its records above 8\,\degC{} and, at 5\,\degC{} and 4\,\degC, is in alarm for 100\,\% of the time, with a single, continuous episode. The critical tier of the two-tier policy would therefore stay silent on the unit with the warmest baseline, and the warning tier would be permanently active. The second outcome is the correct one for a unit that runs warm all the time, but it shows that a warning is a persistent condition for such a unit and not an event, so the policy should report it as a slowly repeated reminder and not as a stream of alerts. It also confirms that \Tmax{} and the warning level must be configurable per unit.
+
+\begin{table}[t]
+\caption{Sensitivity of Alarming to the Upper Threshold, Both Units (2-Hourly Records)}
+\label{tab:sens2}
+\centering
+\footnotesize
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{c|ccc|ccc}
+\toprule
+ & \multicolumn{3}{c|}{Unit 1 ($N=67$)} & \multicolumn{3}{c}{Unit 2 ($N=34$)} \\
+\Tmax{} (\degC) & Rec. & \% & Ep. & Rec. & \% & Ep. \\
+\midrule
+4 & 42 & 62.7 & 3 & 34 & 100 & 1 \\
+5 & 28 & 41.8 & 3 & 34 & 100 & 1 \\
+6 & 19 & 28.4 & 3 & 30 & 88.2 & 2 \\
+8 & 13 & 19.4 & 2 & 15 & 44.1 & 5 \\
+\textbf{10} & \tbd & \tbd & \tbd & \textbf{0} & \textbf{0.0} & \textbf{0} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Implications for the detectors.} The Isolation Forest was not replayed on Unit~2: 34 records at two-hour resolution are too few to train a forest and to calibrate a 2\,\% decision threshold, and the $\Delta T$ feature at that resolution is not comparable with the hourly one used for Unit~1. We can still draw two conclusions. First, the largest two-hour change in Unit~2 was only $+2.92$\,\degC, well below the abrupt transitions that the Unit~1 forest flagged, so that detector would have little to report there. Second, the baseline of Unit~2 (median 7.83\,\degC) lies above the upper quartile of Unit~1, so a forest trained on Unit~1 would very likely treat much of Unit~2's normal operation as unusual. We did not test this, but it supports training one forest per unit on that unit's own baseline.
+
+\subsection{Objective Traceability}
+Table~\ref{tab:obj} maps each objective to the evidence collected and to its status.
+
+\begin{table}[t]
+\caption{Objectives and Evidence}
+\label{tab:obj}
+\centering
+\footnotesize
+\begin{tabular}{p{0.07\columnwidth}p{0.5\columnwidth}p{0.3\columnwidth}}
+\toprule
+Obj. & Evidence in this report & Status \\
+\midrule
+O1 & Hybrid detector designed, replayed on 135 hourly records; two excursions above 10\,\degC{} found; detectors complementary & Demonstrated (hourly replay) \\
+O2 & 16,080 $\rightarrow$ 142 messages, 1,045 $\rightarrow$ 21.8\,kB & Modeled \\
+O3 & Edge $\approx$ 29\,ms flat vs.\ cloud 92\,ms--4.1\,s & Modeled; not yet measured \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%==================================================================
+\section{Limitations and Threats to Validity}
+\begin{itemize}
+\item \textbf{Short trials, two units.} Data cover 5.6 days from one refrigerator and 2.7 days from a second one, each with one sensor, so the findings are case-study evidence and not statistics about refrigerators in general.
+\item \textbf{Hourly and 2-hourly resolution.} The analyzed data are hourly dashboard values (Unit~1) and 2-hourly values (Unit~2); they cannot resolve the 30\,s dynamics the detector is designed for and may smooth short events.
+\item \textbf{No ground truth.} Neither a door sensor nor a log of manual interventions exists, so alarms cannot be scored as true or false positives, and the causes of E1, E2 and X1--X5 are inferred, not observed.
+\item \textbf{Confounded unit comparison.} Differences between Unit~1 and Unit~2 mix appliance, load, set point, sensor position and time; the appliance details of Unit~2 were not recorded.
+\item \textbf{Sensor placement.} The cable passes through the door gasket, creating a small leak that may add heat and moisture exchange; the DHT22's $\pm$0.5\,\degC{} and $\pm$2\,\% accuracy also bound small-difference conclusions.
+\item \textbf{Small training set.} The forest was trained on 61 hourly records; a 2\,\% quantile on so few points is a crude calibration.
+\item \textbf{Modeled results.} Message savings and latency (O2, O3) are analytical or simulated and rest on stated assumptions.
+\item \textbf{Energy is not measured.} Although the project is motivated by sustainability, no electrical measurement was collected; the energy benefit is argued through avoided spoilage and traffic, not demonstrated.
+\end{itemize}
+
+%==================================================================
+\section{Conclusion and Future Work}
+FreshGuard shows that a low-cost sensor, a small microcontroller and a containerized edge service are enough to make an otherwise unmonitored refrigerator observable. In 5.6 days of operation the system exposed a 27-hour warm spell reaching 11.2\,\degC, of which 6\,h lay above the 10\,\degC{} limit, and a shorter transient that a dial thermostat would not have recorded, and it revealed recurring humidity peaks at routine access times. The hybrid detector behaves as designed but also shows its limits: the threshold finds sustained unsafe states, the Isolation Forest finds abrupt transitions, and neither is a substitute for a drift detector, since neither fired during the first 21\,h of the warm spell. The edge-filtered design cuts cloud messages by about 99\,\% and keeps alert latency independent of the WAN, though the last two figures are modeled and should be treated as design estimates until measured. Moving the same sensor to a second refrigerator showed a unit that ran about 3\,\degC{} warmer, was above 5\,\degC{} throughout and above 8\,\degC{} for 44\,\% of its records, yet never crossed the 10\,\degC{} limit, which supports per-unit thresholds, a two-tier alert policy and per-unit detector training.
+
+Future work should: (i) log the raw 30\,s samples alongside the hourly values to allow evaluation at true resolution; (ii) add a door contact and a smart plug to provide ground truth and measure energy; (iii) introduce a two-tier alert policy with hysteresis, with a warning near 5\,\degC{} and a critical alarm at 10\,\degC, configurable per unit; (iv) add a rate-of-change or CUSUM detector for slow drift; (v) measure latency and loss with network emulation and run failure-injection tests on the broker, the Wi-Fi link and the WAN, including store-and-forward of summaries after an outage; (vi) train the forest on a longer baseline for each unit and report precision and recall against labeled events; and (vii) extend to several units and sensors, recording appliance type and set point for each.
+
+%==================================================================
+\appendices
+\section{Detailed Comparison of Related IoT Systems}
+
+% Single-column table pinned in place with [H] so it stays under the
+% Appendix A heading and cannot float past the references.
+\begin{table}[H]
+\caption{Detailed Comparison of Related Refrigeration and Cold-Storage IoT Systems}
+\label{tab:related}
+\centering
+\scriptsize
+\renewcommand{\arraystretch}{1.1}
+\begin{tabular}{@{}p{0.07\columnwidth}p{0.36\columnwidth}p{0.52\columnwidth}@{}}
+\toprule
+Ref. & System and sensor(s) & Processing / role and gap relative to FreshGuard \\
+\midrule
+\cite{dong} & AI-enabled smart refrigeration management; DHT11, light sensor, camera & On-board vision processing with online transmission. No edge-based anomaly detection; continuous cloud dependence. \\
+\cite{arduino} & Arduino refrigerator monitoring; DHT11/DHT22 & Continuous streaming to ThingSpeak. No local decision-making; all sensor data are transmitted. \\
+\cite{loadcell} & IoT smart refrigerator monitoring; load cell & Wi-Fi transmission of refrigerator states. Focuses on inventory and component states rather than thermal anomalies. \\
+\cite{ahmad} & DHT22 evaluation for IoT applications; DHT22 & Measurements logged through Raspberry Pi and MySQL. No edge-cloud anomaly-detection architecture. \\
+\cite{smartfridge} & Low-cost ubiquitous smart refrigerator framework; camera & Partial on-device inference and mobile app interaction. Focuses on inventory recognition rather than thermal monitoring. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\balance
+\begin{thebibliography}{00}
+\bibitem{atp} Council of Europe, ``Agreement on the International Carriage of Perishable Foodstuffs (ATP),'' 2006.
+\bibitem{dong} Z. Dong, A. M. Abdulghani, M. A. Imran, and Q. H. Abbasi, ``Artificial intelligence enabled smart refrigeration management system using internet of things framework,'' in \emph{Proc. 2020 Int. Conf. Computing, Networks and Internet of Things (CNIOT)}, 2020, pp. 65--70.
+\bibitem{arduino} Author(s), ``Internet of things-based (IoT) inventory monitoring refrigerator using Arduino sensor network,'' ResearchGate preprint, 2020.
+\bibitem{loadcell} Author(s), ``IoT based smart refrigerator monitoring system,'' in \emph{Proc. IEEE Conf.}, 2022, doi: 10.1109/document/9815821.
+\bibitem{ahmad} Y. A. Ahmad \emph{et al.}, ``On the evaluation of DHT22 temperature sensor for IoT application,'' presented at [Conference], 2021.
+\bibitem{smartfridge} Author(s), ``A framework for low cost, ubiquitous and interactive smart refrigerator,'' \emph{Multimedia Tools and Applications}, Springer, 2023.
+\bibitem{iira} Industrial Internet Consortium, ``The Industrial Internet Reference Architecture (IIRA),'' Tech. Rep., v1.10.
+\bibitem{iforest} F. T. Liu, K. M. Ting, and Z.-H. Zhou, ``Isolation forest,'' in \emph{Proc. 8th IEEE Int. Conf. Data Mining (ICDM)}, 2008, pp. 413--422.
+\bibitem{mqtt} OASIS, ``MQTT Version 3.1.1,'' OASIS Standard, Oct. 2014.
+\bibitem{shi} W. Shi, J. Cao, Q. Zhang, Y. Li, and L. Xu, ``Edge computing: Vision and challenges,'' \emph{IEEE Internet Things J.}, vol. 3, no. 5, pp. 637--646, Oct. 2016.
+\bibitem{dht22} Aosong Electronics, ``AM2302 (DHT22) digital temperature and humidity sensor,'' datasheet.
+\bibitem{magnus} O. A. Alduchov and R. E. Eskridge, ``Improved Magnus form approximation of saturation vapor pressure,'' \emph{J. Appl. Meteorol.}, vol. 35, no. 4, pp. 601--609, 1996.
+\end{thebibliography}
+
+\end{document}
